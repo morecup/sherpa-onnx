@@ -1,4 +1,3 @@
-*.so
 *.txt
 *.onnx
 *.wav
