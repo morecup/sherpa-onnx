@@ -12,10 +12,10 @@
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
-        android:theme="@style/Theme.SherpaOnnx"
+        android:theme="@style/Theme.MoreCupAiAssistant"
         tools:targetApi="31">
         <activity
-            android:name=".kws.MainActivity"
+            android:name=".MainActivity"
             android:label="Keyword-spotter"
             android:exported="true">
             <intent-filter>

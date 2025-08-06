@@ -1,222 +1,437 @@
-package com.k2fsa.sherpa.onnx.kws
+package com.k2fsa.sherpa.onnx
 
+import ai.picovoice.porcupine.Porcupine
 import android.Manifest
 import android.content.pm.PackageManager
-import android.media.AudioFormat
-import android.media.AudioRecord
-import android.media.MediaRecorder
+import android.graphics.Color
 import android.os.Bundle
-import android.text.method.ScrollingMovementMethod
+import android.os.Handler
+import android.os.Looper
+import android.speech.SpeechRecognizer
 import android.util.Log
-import android.widget.Button
-import android.widget.EditText
+import android.view.View
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import android.widget.ToggleButton
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
-import com.k2fsa.sherpa.onnx.KeywordSpotter
-import com.k2fsa.sherpa.onnx.KeywordSpotterConfig
-import com.k2fsa.sherpa.onnx.OnlineStream
-import com.k2fsa.sherpa.onnx.R
-import com.k2fsa.sherpa.onnx.getFeatureConfig
-import com.k2fsa.sherpa.onnx.getKeywordsFile
-import com.k2fsa.sherpa.onnx.getKwsModelConfig
-import kotlin.concurrent.thread
+import androidx.core.content.ContextCompat
+import com.morecup.AiAnalysisManager
+import com.morecup.IWakeWordManager
+import com.morecup.SpeechRecognizerManager
+import com.morecup.TTSManager
 
-private const val TAG = "sherpa-onnx"
-private const val REQUEST_RECORD_AUDIO_PERMISSION = 200
+enum class AppState {
+    STOPPED,           // 应用停止状态
+    WAKEWORD,          // 唤醒词检测状态
+    LISTENING,         // 语音识别监听状态
+    PROCESSING,        // 语音处理中状态
+    AI_PROCESSING,     // AI请求处理中状态
+    AI_RESPONDING,     // AI响应播放状态
+    TTS_SPEAKING,      // TTS朗读状态
+    CONTINUOUS_DIALOG  // 连续对话状态
+}
 
 class MainActivity : AppCompatActivity() {
-    private val permissions: Array<String> = arrayOf(Manifest.permission.RECORD_AUDIO)
+    private val ACCESS_KEY = "Vo9ii0CIafLGsSI3C7LEIbuLdKhxzr+IJrosP6lTNi4EDef4hX17/g=="
+    private val defaultKeyword = Porcupine.BuiltInKeyword.COMPUTER
 
-    private lateinit var kws: KeywordSpotter
-    private lateinit var stream: OnlineStream
-    private var audioRecord: AudioRecord? = null
-    private lateinit var recordButton: Button
-    private lateinit var textView: TextView
-    private lateinit var inputText: EditText
-    private var recordingThread: Thread? = null
+    private lateinit var intentTextView: TextView
+    private lateinit var intentScrollView: ScrollView
+    private lateinit var recordButton: ToggleButton
 
-    private val audioSource = MediaRecorder.AudioSource.MIC
-    private val sampleRateInHz = 16000
-    private val channelConfig = AudioFormat.CHANNEL_IN_MONO
+    private var currentState: AppState = AppState.STOPPED
 
-    // Note: We don't use AudioFormat.ENCODING_PCM_FLOAT
-    // since the AudioRecord.read(float[]) needs API level >= 23
-    // but we are targeting API level >= 21
-    private val audioFormat = AudioFormat.ENCODING_PCM_16BIT
-    private var idx: Int = 0
-    private var lastText: String = ""
+    // Managers
+    private lateinit var wakeWordManager: IWakeWordManager
+    private lateinit var speechRecognizerManager: SpeechRecognizerManager
+    private lateinit var aiAnalysisManager: AiAnalysisManager
+    private lateinit var ttsManager: TTSManager
 
-    @Volatile
-    private var isRecording: Boolean = false
+    private val mainHandler = Handler(Looper.getMainLooper())
 
-    override fun onRequestPermissionsResult(
-        requestCode: Int, permissions: Array<String>, grantResults: IntArray
-    ) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        val permissionToRecordAccepted = if (requestCode == REQUEST_RECORD_AUDIO_PERMISSION) {
-            grantResults[0] == PackageManager.PERMISSION_GRANTED
-        } else {
-            false
-        }
+    // 连续对话相关
+    private var continuousDialogEnabled = true // 是否启用连续对话
+    private var isContinuousDialogMode = false // 是否处于连续对话模式
 
-        if (!permissionToRecordAccepted) {
-            Log.e(TAG, "Audio record is disallowed")
-            finish()
-        }
-
-        Log.i(TAG, "Audio record is permitted")
+    private fun displayError(message: String) {
+        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        ActivityCompat.requestPermissions(this, permissions, REQUEST_RECORD_AUDIO_PERMISSION)
-
-        Log.i(TAG, "Start to initialize model")
-        initModel()
-        Log.i(TAG, "Finished initializing model")
-
+        intentTextView = findViewById(R.id.intentView)
+        intentScrollView = findViewById(R.id.intentScrollView)
         recordButton = findViewById(R.id.record_button)
-        recordButton.setOnClickListener { onclick() }
 
-        textView = findViewById(R.id.my_text)
-        textView.movementMethod = ScrollingMovementMethod()
-
-        inputText = findViewById(R.id.input_text)
+        // Initialize managers
+        initializeManagers()
     }
 
-    private fun onclick() {
-        if (!isRecording) {
-            var keywords = inputText.text.toString()
+    private fun initializeManagers() {
 
-            Log.i(TAG, keywords)
-            keywords = keywords.replace("\n", "/")
-            keywords = keywords.trim()
-            // If keywords is an empty string, it just resets the decoding stream
-            // always returns true in this case.
-            // If keywords is not empty, it will create a new decoding stream with
-            // the given keywords appended to the default keywords.
-            // Return false if errors occurred when adding keywords, true otherwise.
-            stream.release()
-            stream = kws.createStream(keywords)
-            if (stream.ptr == 0L) {
-                Log.i(TAG, "Failed to create stream with keywords: $keywords")
-                Toast.makeText(this, "Failed to set keywords to $keywords.", Toast.LENGTH_LONG)
-                    .show()
-                return
+        // Initialize speech recognizer manager
+        speechRecognizerManager = SpeechRecognizerManager(this)
+        speechRecognizerManager.setSpeechCallback(object : SpeechRecognizerManager.SpeechCallback {
+            override fun onResults(results: String) {
+                processSpeechResults(results)
             }
 
-            val ret = initMicrophone()
-            if (!ret) {
-                Log.e(TAG, "Failed to initialize microphone")
-                return
+            override fun onPartialResults(partialResults: String) {
+                runOnUiThread {
+                    intentTextView.setTextColor(Color.DKGRAY)
+                    intentTextView.text = partialResults
+                }
             }
-            Log.i(TAG, "state: ${audioRecord?.state}")
-            audioRecord!!.startRecording()
-            recordButton.setText(R.string.stop)
-            isRecording = true
-            textView.text = ""
-            lastText = ""
-            idx = 0
 
-            recordingThread = thread(true) {
-                processSamples()
+            override fun onError(error: Int) {
+                handleSpeechError(error)
             }
-            Log.i(TAG, "Started recording")
-        } else {
-            isRecording = false
-            audioRecord!!.stop()
-            audioRecord!!.release()
-            audioRecord = null
-            recordButton.setText(R.string.start)
-            stream.release()
-            Log.i(TAG, "Stopped recording")
+        })
+
+        // Initialize AI analysis manager
+        aiAnalysisManager = AiAnalysisManager(this)
+
+        // Initialize TTS manager
+        ttsManager = TTSManager(this)
+        ttsManager.setOnInitListener { success ->
+            if (!success) {
+                displayError("TTS initialization failed")
+            }
+        }
+        ttsManager.setCompletionCallback {
+            // TTS播放完成后，切换到下一阶段
+            runOnUiThread {
+                playback(300) // 短暂延迟后进入下一阶段
+            }
+        }
+
+        // Initialize wake word manager
+//        wakeWordManager = WakeWordManager()
+        wakeWordManager = KeywordSpotterManager(this)
+        wakeWordManager.init(applicationContext) {
+//            wakeWordManager.start()
+            onWakeWordDetected()
         }
     }
 
-    private fun processSamples() {
-        Log.i(TAG, "processing samples")
+    private fun processSpeechResults(results: String) {
+        runOnUiThread {
+            intentTextView.setTextColor(Color.WHITE)
+            intentTextView.text = "用户: $results"
+        }
+        queryAI(results)
+    }
 
-        val interval = 0.1 // i.e., 100 ms
-        val bufferSize = (interval * sampleRateInHz).toInt() // in samples
-        val buffer = ShortArray(bufferSize)
-
-        while (isRecording) {
-            val ret = audioRecord?.read(buffer, 0, buffer.size)
-            if (ret != null && ret > 0) {
-                val samples = FloatArray(ret) { buffer[it] / 32768.0f }
-                stream.acceptWaveform(samples, sampleRate = sampleRateInHz)
-                while (kws.isReady(stream)) {
-                    kws.decode(stream)
-
-                    val text = kws.getResult(stream).keyword
-
-                    var textToDisplay = lastText
-
-                    if (text.isNotBlank()) {
-                        // Remember to reset the stream right after detecting a keyword
-
-                        kws.reset(stream)
-                        if (lastText.isBlank()) {
-                            textToDisplay = "$idx: $text"
-                        } else {
-                            textToDisplay = "$idx: $text\n$lastText"
-                        }
-                        lastText = "$idx: $text\n$lastText"
-                        idx += 1
+    private fun handleSpeechError(error: Int) {
+        when (error) {
+            SpeechRecognizer.ERROR_AUDIO -> displayError("Error recording audio.")
+            SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> displayError("Insufficient permissions.")
+            SpeechRecognizer.ERROR_NETWORK_TIMEOUT, SpeechRecognizer.ERROR_NETWORK,
+            SpeechRecognizer.ERROR_NO_MATCH -> {
+                if (recordButton.isChecked) {
+                    displayError("No recognition result matched.")
+                    if (isContinuousDialogMode) {
+                        // 连续对话模式下，出错后继续等待语音输入
+                        startContinuousListening()
+                    } else {
+                        playback(0)
                     }
+                }
+                return
+            }
+            SpeechRecognizer.ERROR_CLIENT -> return
+            SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> displayError("Recognition service is busy.")
+            SpeechRecognizer.ERROR_SERVER -> displayError("Server Error.")
+            SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> {
+                displayError("No speech input.")
+                if (isContinuousDialogMode) {
+                    // 连续对话模式下，超时后继续等待语音输入
+                    startContinuousListening()
+                }
+                return
+            }
+            else -> displayError("Something wrong occurred.")
+        }
+        stopService()
+        recordButton.toggle()
+    }
 
-                    runOnUiThread {
-                        textView.text = textToDisplay
+    private fun startWakeWordDetection() {
+        try {
+            wakeWordManager.start()
+
+//            // 延迟启动语音识别
+//            Handler(Looper.getMainLooper()).postDelayed({
+//                try {
+//                    speechRecognizerManager.startListening()
+//                    updateState(AppState.LISTENING)
+//                } catch (e: Exception) {
+//                    displayError("启动语音识别失败: ${e.message}")
+//                    playback(1000)
+//                }
+//            }, 200)
+        } catch (e: Exception) {
+            displayError("Failed to start wake word detection: ${e.message}")
+        }
+    }
+
+    private fun startContinuousListening() {
+        // 在连续对话模式下直接启动语音识别
+        if (continuousDialogEnabled && isContinuousDialogMode) {
+            try {
+                speechRecognizerManager.startListening()
+                updateState(AppState.LISTENING)
+            } catch (e: Exception) {
+                displayError("启动连续语音识别失败: ${e.message}")
+                // 出错时回退到正常模式
+                isContinuousDialogMode = false
+                playback(1000)
+            }
+        }
+    }
+
+    override fun onStop() {
+        if (recordButton.isChecked) {
+            stopService()
+            recordButton.toggle()
+        }
+        super.onStop()
+    }
+
+    private fun hasRecordPermission(): Boolean {
+        return ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun requestRecordPermission() {
+        ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), 0)
+    }
+
+    private fun playback(milliSeconds: Int) {
+        speechRecognizerManager.stopListening()
+
+        // 如果启用了连续对话，则进入连续对话模式
+        if (continuousDialogEnabled && currentState != AppState.STOPPED) {
+            isContinuousDialogMode = true
+            updateState(AppState.CONTINUOUS_DIALOG)
+
+            mainHandler.postDelayed({
+                if (currentState == AppState.CONTINUOUS_DIALOG) {
+                    startContinuousListening()
+                    intentTextView.setTextColor(Color.WHITE)
+                    intentTextView.text = "请说话...（连续对话模式）"
+                }
+            }, milliSeconds.toLong())
+        } else {
+            // 否则回到唤醒词检测模式
+            isContinuousDialogMode = false
+            updateState(AppState.WAKEWORD)
+
+            mainHandler.postDelayed({
+                if (currentState == AppState.WAKEWORD) {
+                    try {
+                        startWakeWordDetection()
+                    } catch (e: Exception) {
+                        displayError("Failed to start wake word detection.")
                     }
+                    intentTextView.setTextColor(Color.WHITE)
+                    intentTextView.text = "Listening for $defaultKeyword ..."
+                }
+            }, milliSeconds.toLong())
+        }
+    }
+
+    private fun stopService() {
+        ttsManager.stop()
+        speechRecognizerManager.stopListening()
+        wakeWordManager.stop()
+        aiAnalysisManager.stop()
+
+        // 重置连续对话模式
+        isContinuousDialogMode = false
+
+        intentTextView.text = ""
+        updateState(AppState.STOPPED)
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (grantResults.isEmpty() || grantResults[0] == PackageManager.PERMISSION_DENIED) {
+            onPorcupineInitError("Microphone permission is required for this demo")
+        } else {
+            playback(0)
+        }
+    }
+
+    fun process(view: View) {
+        if (recordButton.isChecked) {
+            if (hasRecordPermission()) {
+                playback(0)
+            } else {
+                requestRecordPermission()
+            }
+        } else {
+            stopService()
+        }
+    }
+
+    override fun onDestroy() {
+        ttsManager.shutdown()
+        speechRecognizerManager.destroy()
+        wakeWordManager.destroy()
+        super.onDestroy()
+    }
+
+    private fun queryAI(query: String) {
+        updateState(AppState.AI_PROCESSING)
+        intentTextView.append("\n")
+        intentTextView.append("AI: ")
+
+        aiAnalysisManager.analyzeText(query, object : AiAnalysisManager.AiAnalysisCallback {
+            override fun onStreamText(text: String) {
+                // 更新UI显示AI响应
+                runOnUiThread {
+                    intentTextView.setTextColor(Color.WHITE)
+                    intentTextView.append(text)
+                    scrollToBottom() // 自动滚动到底部
+                }
+
+                // 将文本片段传递给TTS进行流式朗读
+                ttsManager.speakStreamText(text)
+                updateState(AppState.AI_RESPONDING)
+            }
+
+            override fun onSuccess(response: String) {
+                // 整个响应完成，刷新TTS缓冲区
+//                ttsManager.flushBuffer()
+            }
+
+            override fun onStreamComplete() {
+                // 流式响应完成，根据模式决定下一步操作
+                updateState(AppState.TTS_SPEAKING)
+
+//                // 在TTS播放完成后，根据是否启用连续对话来决定下一步
+//                mainHandler.postDelayed({
+//                    playback(1000) // 短暂延迟后进入下一阶段
+//                }, 1000)
+            }
+
+            override fun onError(error: String) {
+                runOnUiThread {
+                    displayError("AI 请求异常: $error")
+                    // 出错时重置连续对话模式
+                    isContinuousDialogMode = false
+                    playback(1000)
+                }
+            }
+        })
+    }
+
+    private fun onPorcupineInitError(errorMessage: String) {
+        runOnUiThread {
+            val errorText = findViewById<TextView>(R.id.errorMessage)
+            errorText.text = errorMessage
+            errorText.visibility = View.VISIBLE
+
+            recordButton.background = ContextCompat.getDrawable(
+                applicationContext,
+                R.drawable.disabled_button_background
+            )
+            recordButton.isChecked = false
+            recordButton.isEnabled = false
+        }
+    }
+
+    private fun updateState(newState: AppState) {
+        Log.d("MainActivity", "State changed from $currentState to $newState")
+        currentState = newState
+
+        // 可以在这里添加UI更新逻辑，例如显示当前状态
+        runOnUiThread {
+            // 根据状态更新UI元素
+            when (newState) {
+                AppState.STOPPED -> {
+                    // 停止状态UI更新
+                }
+                AppState.WAKEWORD -> {
+                    // 唤醒词检测状态UI更新
+                }
+                AppState.LISTENING -> {
+                    // 语音识别监听状态UI更新
+                }
+                AppState.PROCESSING -> {
+                    // 语音处理中状态UI更新
+                }
+                AppState.AI_PROCESSING -> {
+                    // AI请求处理中状态UI更新
+                }
+                AppState.AI_RESPONDING -> {
+                    // AI响应播放状态UI更新
+                }
+                AppState.TTS_SPEAKING -> {
+                    // TTS朗读状态UI更新
+                }
+                AppState.CONTINUOUS_DIALOG -> {
+                    // 连续对话状态UI更新
+                    intentTextView.text = "连续对话模式..."
                 }
             }
         }
     }
 
-    private fun initMicrophone(): Boolean {
-        if (ActivityCompat.checkSelfPermission(
-                this, Manifest.permission.RECORD_AUDIO
-            ) != PackageManager.PERMISSION_GRANTED
-        ) {
-            ActivityCompat.requestPermissions(this, permissions, REQUEST_RECORD_AUDIO_PERMISSION)
-            return false
-        }
-
-        val numBytes = AudioRecord.getMinBufferSize(sampleRateInHz, channelConfig, audioFormat)
-        Log.i(
-            TAG, "buffer size in milliseconds: ${numBytes * 1000.0f / sampleRateInHz}"
-        )
-
-        audioRecord = AudioRecord(
-            audioSource,
-            sampleRateInHz,
-            channelConfig,
-            audioFormat,
-            numBytes * 2 // a sample has two bytes as we are using 16-bit PCM
-        )
-        return true
+    // 公共方法，允许外部控制是否启用连续对话
+    fun setContinuousDialogEnabled(enabled: Boolean) {
+        continuousDialogEnabled = enabled
     }
 
-    private fun initModel() {
-        // Please change getKwsModelConfig() to add new models
-        // See https://k2-fsa.github.io/sherpa/onnx/kws/pretrained_models/index.html
-        // for a list of available models
-        val type = 0
-        Log.i(TAG, "Select model type $type")
-        val config = KeywordSpotterConfig(
-            featConfig = getFeatureConfig(sampleRate = sampleRateInHz, featureDim = 80),
-            modelConfig = getKwsModelConfig(type = type)!!,
-            keywordsFile = getKeywordsFile(type = type),
-        )
+    // 公共方法，检查是否处于连续对话模式
+    fun isContinuousDialogMode(): Boolean {
+        return isContinuousDialogMode
+    }
 
-        kws = KeywordSpotter(
-            assetManager = application.assets,
-            config = config,
-        )
-        stream = kws.createStream()
+    private fun scrollToBottom() {
+        intentScrollView.post {
+            intentScrollView.fullScroll(ScrollView.FOCUS_DOWN)
+        }
+    }
+
+    // 处理唤醒词检测事件
+    private fun onWakeWordDetected() {
+        runOnUiThread {
+            //也许还需要处理这些状态
+//            LISTENING,         // 语音识别监听状态
+//            PROCESSING,        // 语音处理中状态
+            // 如果正在朗读TTS，则打断
+            if (currentState == AppState.TTS_SPEAKING || currentState == AppState.AI_RESPONDING || currentState == AppState.AI_RESPONDING) {
+                aiAnalysisManager.stop()
+                ttsManager.stop()
+                intentTextView.text = "已打断当前朗读"
+            }
+
+            // 清空当前界面文本
+            intentTextView.text = ""
+
+            // 重置状态并进入下一轮对话
+            isContinuousDialogMode = false
+            updateState(AppState.WAKEWORD)
+
+            // 立即开始下一轮对话
+            try {
+                speechRecognizerManager.startListening()
+                updateState(AppState.LISTENING)
+            } catch (e: Exception) {
+                displayError("启动语音识别失败: ${e.message}")
+            }
+        }
     }
 }
